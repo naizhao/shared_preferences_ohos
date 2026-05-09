@@ -27,7 +27,38 @@ import {
 
 const TAG = "SharedPreferencesOhosPlugin";
 const PREFERENCES_NAME = "FlutterSharedPreferences";
+
+// Magic prefixes that match the Android implementation byte-for-byte.
+// See dart-side `shared_preferences_legacy.dart` doc on `setString`:
+//
+//   Note: Due to limitations in Android's SharedPreferences,
+//   values cannot start with any one of the following:
+//   - 'VGhpcyBpcyB0aGUgcHJlZml4IGZvciBhIGxpc3Qu'   (LIST)
+//   - 'VGhpcyBpcyB0aGUgcHJlZml4IGZvciBCaWdJbnRlZ2Vy' (BIGINT/Int)
+//   - 'VGhpcyBpcyB0aGUgcHJlZml4IGZvciBEb3VibGUu'    (DOUBLE)
+//
+// The OHOS @ohos.data.preferences backend serializes all values as strings
+// across cross-process / persistence boundaries, so type info is lost
+// unless we wrap doubles / ints with these markers (matching Android). Without
+// the markers, dart-side `_preferenceCache[key] as double?` throws
+// `type 'String' is not a subtype of type 'double?'` after a cold restart.
 const LIST_IDENTIFIER = "VGhpcyBpcyB0aGUgcHJlZml4IGZvciBhIGxpc3Qu";
+const DOUBLE_IDENTIFIER = "VGhpcyBpcyB0aGUgcHJlZml4IGZvciBEb3VibGUu";
+const BIGINT_IDENTIFIER = "VGhpcyBpcyB0aGUgcHJlZml4IGZvciBCaWdJbnRlZ2Vy";
+
+/// Encode a double as `DOUBLE_IDENTIFIER + value.toString()`.
+/// `Number.toString()` on a finite double round-trips losslessly via
+/// `parseFloat`. Non-finite (NaN / Infinity) values are out of scope —
+/// pigeon spec says `bool setDouble(double value)`, dart-side double can
+/// be NaN but we don't try to round-trip it (rare; preserved as-is).
+function encodeDouble(value: number): string {
+  return DOUBLE_IDENTIFIER + value.toString();
+}
+
+/// Encode a BigInt as `BIGINT_IDENTIFIER + value.toString()`.
+function encodeBigInt(value: bigint): string {
+  return BIGINT_IDENTIFIER + value.toString();
+}
 
 // ListEncoder implementation
 interface ListEncoder {
@@ -67,7 +98,12 @@ class SharedPreferencesAsyncApiImpl implements SharedPreferencesAsyncApi {
         return null;
       }
       const value = await this.plugin.preferences.get(key, null) as ExtendedPreferenceValue;
-      if (typeof value === 'string' && !value.startsWith(LIST_IDENTIFIER)) {
+      // 必须排除全部 3 个 magic prefix（LIST / DOUBLE / BIGINT），否则
+      // 应用 setDouble("k", 3.14) 后再 getString("k") 会拿到带前缀的乱码。
+      if (typeof value === 'string' &&
+          !value.startsWith(LIST_IDENTIFIER) &&
+          !value.startsWith(DOUBLE_IDENTIFIER) &&
+          !value.startsWith(BIGINT_IDENTIFIER)) {
         return value;
       }
       return null;
@@ -96,6 +132,17 @@ class SharedPreferencesAsyncApiImpl implements SharedPreferencesAsyncApi {
         return null;
       }
       const value = await this.plugin.preferences.get(key, null) as ExtendedPreferenceValue;
+      // 优先 magic prefix string（持久化路径，OHOS 把 number 转为 string）。
+      if (typeof value === 'string' && value.startsWith(DOUBLE_IDENTIFIER)) {
+        const numStr = value.substring(DOUBLE_IDENTIFIER.length);
+        const parsed = parseFloat(numStr);
+        if (!Number.isNaN(parsed)) {
+          return parsed;
+        }
+        Log.w(TAG, "Failed to decode double: " + numStr);
+        return null;
+      }
+      // 进程内尚未持久化时 OHOS 仍可能保留原 number 类型 — 兼容直接返回。
       if (typeof value === 'number') {
         return value;
       } else if (typeof value === 'bigint') {
@@ -114,6 +161,17 @@ class SharedPreferencesAsyncApiImpl implements SharedPreferencesAsyncApi {
         return null;
       }
       const value = await this.plugin.preferences.get(key, BigInt(0)) as ExtendedPreferenceValue;
+      // 优先 magic prefix string（持久化路径，OHOS 把 bigint 转为 string）。
+      if (typeof value === 'string' && value.startsWith(BIGINT_IDENTIFIER)) {
+        const numStr = value.substring(BIGINT_IDENTIFIER.length);
+        try {
+          return BigInt(numStr);
+        } catch (err) {
+          Log.w(TAG, "Failed to decode bigint: " + numStr);
+          return null;
+        }
+      }
+      // 进程内尚未持久化时兼容直接 bigint / number。
       if (typeof value ==='bigint' || typeof value === 'number'){
         return BigInt(value);
       }
@@ -540,7 +598,9 @@ export default class SharedPreferencesOhosPlugin implements FlutterPlugin, Share
   }
 
   async setString(key: string, value: string): Promise<void> {
-    if (value.startsWith(LIST_IDENTIFIER)) {
+    if (value.startsWith(LIST_IDENTIFIER) ||
+        value.startsWith(DOUBLE_IDENTIFIER) ||
+        value.startsWith(BIGINT_IDENTIFIER)) {
       return Promise.reject(new Error(
         "StorageError: This string cannot be stored as it clashes with special identifier prefixes"));
     }
@@ -548,7 +608,10 @@ export default class SharedPreferencesOhosPlugin implements FlutterPlugin, Share
   }
 
   async setInt(key: string, value: bigint): Promise<void> {
-    return this.put(key, value);
+    // Wrap with BIGINT_IDENTIFIER so getAll returns recognizable string after
+    // a cold restart (OHOS preferences serializes everything as string on
+    // persistence). transformPref decodes back to bigint.
+    return this.put(key, encodeBigInt(value));
   }
 
   put(key: string, value: ESObject): Promise<void> {
@@ -566,10 +629,15 @@ export default class SharedPreferencesOhosPlugin implements FlutterPlugin, Share
   }
 
   async setDouble(key: string, value: number): Promise<void> {
-    return this.put(key, value);
+    // Wrap with DOUBLE_IDENTIFIER so getAll returns recognizable string after
+    // a cold restart (OHOS preferences serializes everything as string on
+    // persistence). transformPref decodes back to number.
+    return this.put(key, encodeDouble(value));
   }
 
   async setBool(key: string, value: boolean): Promise<void> {
+    // boolean round-trips correctly via OHOS preferences (typeof check works);
+    // no marker needed.
     return this.put(key, value);
   }
 
@@ -609,13 +677,34 @@ export default class SharedPreferencesOhosPlugin implements FlutterPlugin, Share
   }
 
   transformPref(value: ExtendedPreferenceValue): ESObject {
-    if (typeof value === 'string' && value.startsWith(LIST_IDENTIFIER)) {
-      try {
-        const decoded: string[] = this.listEncoder.decode(value.substring(LIST_IDENTIFIER.length));
-        return decoded;
-      } catch (err) {
-        Log.w(TAG, "Failed to decode list: " + JSON.stringify(err));
+    if (typeof value === 'string') {
+      if (value.startsWith(LIST_IDENTIFIER)) {
+        try {
+          const decoded: string[] =
+              this.listEncoder.decode(value.substring(LIST_IDENTIFIER.length));
+          return decoded;
+        } catch (err) {
+          Log.w(TAG, "Failed to decode list: " + JSON.stringify(err));
+          return value;
+        }
+      }
+      if (value.startsWith(DOUBLE_IDENTIFIER)) {
+        const numStr = value.substring(DOUBLE_IDENTIFIER.length);
+        const parsed = parseFloat(numStr);
+        if (!Number.isNaN(parsed)) {
+          return parsed;
+        }
+        Log.w(TAG, "Failed to decode double: " + numStr);
         return value;
+      }
+      if (value.startsWith(BIGINT_IDENTIFIER)) {
+        const numStr = value.substring(BIGINT_IDENTIFIER.length);
+        try {
+          return BigInt(numStr);
+        } catch (err) {
+          Log.w(TAG, "Failed to decode bigint: " + numStr);
+          return value;
+        }
       }
     }
     if (typeof value === 'bigint') {
